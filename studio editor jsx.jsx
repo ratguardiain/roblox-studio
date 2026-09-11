@@ -35,6 +35,136 @@ const MATERIALS = ["Plastic", "Neon", "Metal", "Wood", "Glass"];
 let idCounter = 1;
 const nextId = () => idCounter++;
 
+// ----------------------------- script runtimes -----------------------------
+// Supported languages:
+//   Luau: @luau-rs/luau
+//   Lua: Fengari (Lua 5.3)
+//   Python: Pyodide (CPython/WASM)
+//   C++: YoWASP Clang -> WASI/Wasm (requires a browser-capable WASI runtime)
+let luauModulePromise = null;
+let luaModulePromise = null;
+let pyodideModulePromise = null;
+let pyodidePromise = null;
+let cppModulesPromise = null;
+
+async function runLuauSource(source, onPrint) {
+  if (!source || !source.trim()) return { ok: true, values: [] };
+  if (!luauModulePromise) luauModulePromise = import("@luau-rs/luau");
+  const { LuaWorker } = await luauModulePromise;
+  using lua = new LuaWorker();
+  lua.addEventListener("print", (event) => {
+    if (onPrint) onPrint(event.text);
+  });
+  return await lua.execute(source);
+}
+
+async function runLuaSource(source, onPrint) {
+  if (!source || !source.trim()) return { ok: true, values: [] };
+  if (!luaModulePromise) luaModulePromise = Promise.all([import("fengari"), import("fengari-interop")]);
+  const [{ lua, lauxlib, lualib, to_luastring, to_jsstring }, interop] = await luaModulePromise;
+  const L = lauxlib.luaL_newstate();
+  lualib.luaL_openlibs(L);
+  try {
+    // Replace Lua's print with a host callback so output appears in the editor.
+    lua.lua_pushjsfunction(L, (...args) => {
+      const values = [];
+      for (const arg of args) values.push(String(arg));
+      if (onPrint) onPrint(values.join("\t"));
+      return 0;
+    });
+    lua.lua_setglobal(L, to_luastring("print"));
+    const status = lauxlib.luaL_loadstring(L, to_luastring(source));
+    if (status !== lua.LUA_OK) {
+      throw new Error(to_jsstring(lua.lua_tostring(L, -1)));
+    }
+    const callStatus = lua.lua_pcall(L, 0, lua.LUA_MULTRET, 0);
+    if (callStatus !== lua.LUA_OK) {
+      throw new Error(to_jsstring(lua.lua_tostring(L, -1)));
+    }
+    return { ok: true, values: [] };
+  } finally {
+    lua.lua_close(L);
+  }
+}
+
+async function getPyodide() {
+  if (!pyodideModulePromise) pyodideModulePromise = import("pyodide");
+  if (!pyodidePromise) {
+    const { loadPyodide, version } = await pyodideModulePromise;
+    pyodidePromise = loadPyodide({
+      indexURL: `https://cdn.jsdelivr.net/pyodide/v${version}/full/`,
+    });
+  }
+  return pyodidePromise;
+}
+
+async function runPythonSource(source, onPrint) {
+  if (!source || !source.trim()) return { ok: true, values: [] };
+  const pyodide = await getPyodide();
+  // Capture print() without allowing arbitrary JavaScript access through globals.
+  pyodide.globals.set("__studio_print", (text) => {
+    if (onPrint) onPrint(String(text));
+  });
+  await pyodide.runPythonAsync(`
+import builtins as __builtins__
+_original_print = __builtins__.print
+__builtins__.print = lambda *args, **kwargs: __studio_print(" ".join(str(x) for x in args))
+try:
+    exec(${JSON.stringify(source)})
+finally:
+    __builtins__.print = _original_print
+`);
+  return { ok: true, values: [] };
+}
+
+async function getCppModules() {
+  if (!cppModulesPromise) {
+    cppModulesPromise = Promise.all([
+      import("@yowasp/clang"),
+      import("@wasmer/wasi"),
+    ]);
+  }
+  return cppModulesPromise;
+}
+
+async function runCppSource(source, onPrint) {
+  if (!source || !source.trim()) return { ok: true, values: [] };
+  const [{ runClang }, { init, WASI }] = await getCppModules();
+  await init();
+  const filename = "studio_script.cpp";
+  const executable = "studio_script";
+  const { [executable]: wasmBytes, "a.out": fallbackBytes } = await runClang(
+    ["clang++", filename, "-std=c++20", "-O1", "-o", executable],
+    { [filename]: source },
+  );
+  const bytes = wasmBytes || fallbackBytes;
+  if (!bytes) throw new Error("C++ compiler did not produce a WebAssembly executable");
+  const wasi = new WASI({ args: [executable] });
+  const module = await WebAssembly.compile(bytes);
+  await wasi.instantiate(module, {});
+  const exitCode = wasi.start();
+  const stdout = wasi.getStdoutString ? wasi.getStdoutString() : "";
+  if (stdout && onPrint) stdout.split(/\r?\n/).filter(Boolean).forEach(onPrint);
+  return { ok: exitCode === 0, values: [], exitCode, stdout };
+}
+
+async function runSourceByLanguage(language, source, onPrint) {
+  switch (language) {
+    case "Lua":
+      return runLuaSource(source, onPrint);
+    case "Python":
+      return runPythonSource(source, onPrint);
+    case "C++":
+      return runCppSource(source, onPrint);
+    case "Luau":
+    default:
+      return runLuauSource(source, onPrint);
+  }
+}
+
+const SCRIPT_LANGUAGES = ["Luau", "Lua", "Python", "C++"];
+const SCRIPT_EXTENSIONS = { Luau: "luau", Lua: "lua", Python: "py", "C++": "cpp" };
+
 // ----------------------------- geometry helpers -----------------------------
 
 function createWedgeGeometry() {
@@ -526,7 +656,7 @@ const DEFAULT_PROPS = {
   blur: { enabled: true, size: 10 },
   humanoid: { health: 100, maxHealth: 100, walkSpeed: 16 },
   gui: {},
-  script: { code: "-- write your code here\n" },
+  script: { language: "Luau", code: "-- write your code here\n" },
   guipart: { color: "#7fd1e0" },
 };
 
@@ -643,6 +773,7 @@ export default function StudioEditor() {
   const [selectedExtra, setSelectedExtra] = useState(null); // { service, id }
   const [dragOverKey, setDragOverKey] = useState(null); // id/key of the row currently being dragged over
   const [fireToast, setFireToast] = useState(null);
+  const [scriptBusy, setScriptBusy] = useState(false);
   const fireToastTimeoutRef = useRef(null);
   const dragPartIdRef = useRef(null);
   const dragExtraRef = useRef(null); // { service, id }
@@ -812,6 +943,43 @@ export default function StudioEditor() {
   const fireRemoteEvent = useCallback((name) => {
     showToast(`🔥 ${name} fired!`);
   }, [showToast]);
+
+  const runScript = useCallback(async (service, id) => {
+    const node = treeFind(extraTreesRef.current[service] || [], id);
+    if (!node || node.type !== "script") return;
+
+    const language = node.props?.language || "Luau";
+    setScriptBusy(true);
+    const output = [];
+    try {
+      const result = await runSourceByLanguage(language, node.props?.code || "", (text) => output.push(String(text)));
+      if (!result?.ok) {
+        showToast(`❌ ${node.name} (${language}): ${result?.error?.message || `Exited with code ${result?.exitCode ?? 1}`}`);
+        return;
+      }
+      if (output.length) showToast(`▶ ${node.name} [${language}]: ${output.join(" | ")}`);
+      else showToast(`✅ ${node.name} [${language}] ran`);
+    } catch (error) {
+      showToast(`❌ ${node.name} (${language}): ${error?.message || String(error)}`);
+    } finally {
+      setScriptBusy(false);
+    }
+  }, [showToast]);
+
+  const runAllScripts = useCallback(() => {
+    const jobs = [];
+    Object.entries(extraTreesRef.current || {}).forEach(([service, list]) => {
+      treeForEach(list || [], (node) => {
+        if (node.type === "script" && node.props?.code?.trim()) jobs.push([service, node.id]);
+      });
+    });
+    if (!jobs.length) {
+      showToast("▶ No scripts to run");
+      return;
+    }
+    jobs.forEach(([service, id]) => runScript(service, id));
+    showToast(`▶ Starting ${jobs.length} script${jobs.length === 1 ? "" : "s"}…`);
+  }, [runScript, showToast]);
 
   const openScriptExternally = useCallback((target) => {
     const uri = target === "vscode" ? "vscode://file/untitled.lua" : "visualstudio://open/untitled.lua";
@@ -1633,7 +1801,10 @@ export default function StudioEditor() {
   const togglePlay = () => {
     setPlayMode((p) => {
       const next = !p;
-      if (next) selectObject(null);
+      if (next) {
+        selectObject(null);
+        setTimeout(() => runAllScripts(), 0);
+      }
       return next;
     });
   };
@@ -2046,7 +2217,19 @@ export default function StudioEditor() {
 
                   {node.type === "script" && (
                     <>
-                      <PropField label="Code">
+                      <PropField label="Language">
+                        <select
+                          disabled={playMode || scriptBusy}
+                          value={props.language || "Luau"}
+                          onChange={(e) => setExtraProp(svc, node.id, "language", e.target.value)}
+                          style={inputStyle}
+                        >
+                          {SCRIPT_LANGUAGES.map((language) => (
+                            <option key={language} value={language}>{language}</option>
+                          ))}
+                        </select>
+                      </PropField>
+                      <PropField label={`Code (.${SCRIPT_EXTENSIONS[props.language || "Luau"] || "txt"})`}>
                         <textarea
                           disabled={playMode}
                           value={props.code || ""}
@@ -2056,6 +2239,13 @@ export default function StudioEditor() {
                           style={{ ...inputStyle, fontFamily: "Consolas, monospace", resize: "vertical" }}
                         />
                       </PropField>
+                      <button
+                        disabled={playMode || scriptBusy}
+                        onClick={() => runScript(svc, node.id)}
+                        style={{ ...typeBtnStyle, flexDirection: "row", width: "100%" }}
+                      >
+                        {scriptBusy ? "⏳ Running…" : "▶ Run Script"}
+                      </button>
                       <div style={{ display: "flex", gap: 6 }}>
                         <button disabled={playMode} onClick={() => openScriptExternally("vscode")} style={{ ...typeBtnStyle, flexDirection: "row", flex: 1, width: "auto" }}>
                           🔵 VS Code

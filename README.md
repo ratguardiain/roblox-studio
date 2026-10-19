@@ -1,13 +1,17 @@
-# roblox-studio
+# ez studio
 
-im recreating roblox studio but with out Roblox's limitations
-still a work in progress and requires a browser for now tested on Firefox and chrome
+this is ez studio the easiest way to make a game
+in stead of clicking threw menus and still not finding 
+anything instead its all in one place easy to find and use 
+inspired by roblox studio this is the next best way to make a game
+with out the hassle of unity or unreal having to ruin the experience of building a game
 
-i have added the hub where you can create and name a project
 
-i have added the newest editor i made
 
 # info
 
-the studio editor jsx is the original jsx file and it just gets 
-converted into HTML because i did not know how to show the game and to tast it
+im recreating roblox studio but with out Roblox's limitations and unity or unreals complications
+still a work in progress and requires a browser for now tested on Firefox and chrome
+i have added the hub where you can create and name a project
+i have added the newest editor i made
+
